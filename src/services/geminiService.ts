@@ -13,6 +13,10 @@ import type {
  * Override via server-side GEMINI_MODEL environment variable if desired.
  */
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
+export const FALLBACK_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+
+const DAILY_QUOTA_COOLDOWN_MS = 10 * 60 * 1000;
+const modelQuotaCooldownUntil = new Map<string, number>();
 
 const DEPRECATED_MODELS = new Set([
   'gemini-1.5-flash',
@@ -85,6 +89,24 @@ function getAiClient(): GoogleGenAI {
   });
 }
 
+function isDailyQuotaExhausted(rawMessage: string): boolean {
+  const upper = rawMessage.toUpperCase();
+  if (
+    upper.includes('REQUESTSPERDAY') ||
+    upper.includes('PERDAY') ||
+    upper.includes('FREE_TIER_REQUESTS') ||
+    upper.includes('FREETIER') ||
+    upper.includes('PER DAY LIMIT')
+  ) {
+    return true;
+  }
+  const delayMatch = rawMessage.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+  if (delayMatch && Number(delayMatch[1]) >= 60) {
+    return true;
+  }
+  return false;
+}
+
 function classifyGeminiError(error: unknown): Error {
   if (
     error instanceof GeminiConfigError ||
@@ -102,8 +124,13 @@ function classifyGeminiError(error: unknown): Error {
     );
   }
   if (upper.includes('RESOURCE_EXHAUSTED') || upper.includes('429')) {
+    if (isDailyQuotaExhausted(rawMessage)) {
+      return new GeminiRateLimitError(
+        'Your Gemini API Free Tier daily quota has been reached across available models. Select a billing-enabled API key in Settings > Secrets to increase your quota, or try again once the daily limit resets.'
+      );
+    }
     return new GeminiRateLimitError(
-      'Gemini API quota or rate limit was reached. Please wait a moment and try again.'
+      'Gemini API rate limit was reached. Please wait a few seconds and try again.'
     );
   }
   if (upper.includes('NOT_FOUND') || upper.includes('404')) {
@@ -124,30 +151,87 @@ function classifyGeminiError(error: unknown): Error {
   );
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+function getOrderedCandidateModels(): string[] {
+  const primary = getConfiguredGeminiModel();
+  const baseList = primary === FALLBACK_GEMINI_MODEL ? [primary] : [primary, FALLBACK_GEMINI_MODEL];
+  const now = Date.now();
+  const available = baseList.filter((m) => (modelQuotaCooldownUntil.get(m) ?? 0) <= now);
+  const cooled = baseList.filter((m) => (modelQuotaCooldownUntil.get(m) ?? 0) > now);
+  return [...available, ...cooled];
+}
+
+async function executeWithModelFallback<T>(
+  fn: (model: string) => Promise<T>,
+  maxRetries = 2
+): Promise<T> {
+  const candidates = getOrderedCandidateModels();
   let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error: unknown) {
-      lastError = error;
-      if (error instanceof GeminiConfigError) {
-        throw error;
+
+  for (let idx = 0; idx < candidates.length; idx++) {
+    const model = candidates[idx];
+    const hasFallback = idx < candidates.length - 1;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await fn(model);
+        modelQuotaCooldownUntil.delete(model);
+        return result;
+      } catch (error: unknown) {
+        lastError = error;
+        if (error instanceof GeminiConfigError) {
+          throw error;
+        }
+        const rawMsg = error instanceof Error ? error.message : String(error);
+        const upper = rawMsg.toUpperCase();
+
+        // Auth/key errors cannot be resolved by retrying or switching models
+        if (upper.includes('API_KEY_INVALID') || upper.includes('PERMISSION_DENIED') || upper.includes('403')) {
+          throw classifyGeminiError(error);
+        }
+
+        // Daily Free Tier quota exhaustion: do not hammer retries on this model; immediately try fallback
+        if ((upper.includes('429') || upper.includes('RESOURCE_EXHAUSTED')) && isDailyQuotaExhausted(rawMsg)) {
+          modelQuotaCooldownUntil.set(model, Date.now() + DAILY_QUOTA_COOLDOWN_MS);
+          if (hasFallback) {
+            console.warn(
+              `Gemini model "${model}" reached its daily quota; switching to fallback model "${candidates[idx + 1]}".`
+            );
+          }
+          break;
+        }
+
+        // Model not available for this key: immediately try fallback model
+        if ((upper.includes('NOT_FOUND') || upper.includes('404')) && hasFallback) {
+          console.warn(
+            `Gemini model "${model}" returned 404; switching to fallback model "${candidates[idx + 1]}".`
+          );
+          break;
+        }
+
+        const isTransient =
+          upper.includes('429') ||
+          upper.includes('RESOURCE_EXHAUSTED') ||
+          upper.includes('503') ||
+          upper.includes('UNAVAILABLE') ||
+          upper.includes('DEADLINE_EXCEEDED') ||
+          upper.includes('TIMEOUT');
+
+        if (!isTransient) {
+          // Non-transient error (e.g., 400 invalid argument)
+          throw classifyGeminiError(error);
+        }
+
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt)));
+        } else if (hasFallback) {
+          console.warn(
+            `Gemini model "${model}" failed after retries; trying fallback model "${candidates[idx + 1]}".`
+          );
+        }
       }
-      const msg = (error instanceof Error ? error.message : String(error)).toUpperCase();
-      const isRetryable =
-        msg.includes('429') ||
-        msg.includes('RESOURCE_EXHAUSTED') ||
-        msg.includes('503') ||
-        msg.includes('UNAVAILABLE') ||
-        msg.includes('DEADLINE_EXCEEDED') ||
-        msg.includes('TIMEOUT');
-      if (!isRetryable || attempt === maxRetries) {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 700 * Math.pow(2, attempt)));
     }
   }
+
   console.error(
     'Gemini API error:',
     lastError instanceof Error ? lastError.message : 'Unknown upstream error'
@@ -250,7 +334,6 @@ export async function generateCareerChatReply(
   context: CareerContext
 ): Promise<string> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const systemInstruction = `You are CHADHUVUKO, an elite, trustworthy, calm, and practical AI career strategist and partner.
 Rules:
@@ -267,7 +350,7 @@ ${context.primaryResumeText ? `Primary Resume Text:\n${context.primaryResumeText
 
   const normalizedHistory = normalizeChatHistory(history);
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const chat = ai.chats.create({
       model,
       history: normalizedHistory,
@@ -313,7 +396,6 @@ export async function analyzeResumeWithAI(
   targetRole?: string
 ): Promise<ResumeAnalysisOutput> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Analyze the following resume carefully${targetRole ? ` for a target role of "${targetRole}"` : ''}.
 Strictly adhere to factual content present in the resume. NEVER invent experience, metrics, employers, or degrees.
@@ -327,7 +409,7 @@ Provide transparent, explainable rubric scores (0-100):
 Resume Content:
 ${resumeText.slice(0, 16000)}`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
@@ -473,7 +555,6 @@ export async function analyzeJobMatchWithAI(input: {
   resumeText: string;
 }): Promise<JobMatchOutput> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Evaluate candidate fit between the resume and the target job. Be objective, accurate, and grounded strictly in the provided text.
 Include:
@@ -491,7 +572,7 @@ ${input.jobDescription.slice(0, 10000)}
 Candidate Resume:
 ${input.resumeText.slice(0, 14000)}`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
@@ -554,7 +635,6 @@ export async function tailorResumeWithAI(input: {
   jobDescription: string;
 }): Promise<TailoredResumeOutput> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Tailor the candidate's resume for the target role.
 STRICT INTEGRITY RULES:
@@ -570,7 +650,7 @@ ${input.jobDescription.slice(0, 9000)}
 Original Resume:
 ${input.resumeText.slice(0, 14000)}`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
@@ -625,7 +705,6 @@ export async function generateCoverLetterWithAI(input: {
   tone: string;
 }): Promise<string> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Write a compelling, authentic cover letter for ${input.jobTitle} at ${input.company} in a "${input.tone}" tone.
 STRICT RULES:
@@ -639,7 +718,7 @@ ${input.jobDescription.slice(0, 8000)}
 Candidate Resume:
 ${input.resumeText.slice(0, 12000)}`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
@@ -668,7 +747,6 @@ export async function generateInterviewQuestionsWithAI(input: {
   resumeText?: string;
 }): Promise<{ question: string; questionType: string; sampleAnswer: string }[]> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Generate 5 realistic, high-signal interview questions for a "${input.jobTitle}"${input.company ? ` role at "${input.company}"` : ''}.
 Focus category: ${input.category}
@@ -676,7 +754,7 @@ Difficulty level: ${input.difficulty}
 ${input.resumeText ? `Candidate Resume Context (tailor questions to probe real background without inventing anything):\n${input.resumeText.slice(0, 6000)}` : ''}
 For each question, include a strong STAR-structured sample answer guide.`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
@@ -728,7 +806,6 @@ export async function evaluateInterviewAnswerWithAI(input: {
   sampleAnswer: string;
 }> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Evaluate this interview response honestly and constructively.
 Role: ${input.jobTitle} (${input.difficulty}, ${input.questionType})
@@ -737,7 +814,7 @@ Candidate Answer: ${input.userAnswer}
 
 Score from 0 to 100 based on clarity, relevance, depth, ownership, and STAR completeness. Provide concrete STAR feedback (Situation, Task, Action, Result), strengths, specific improvements, and a refined model response.`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
@@ -809,7 +886,6 @@ export async function generateCareerRoadmapWithAI(input: {
   milestones: RoadmapMilestone[];
 }> {
   const ai = getAiClient();
-  const model = getConfiguredGeminiModel();
 
   const prompt = `Create a structured, actionable ${input.timelineWeeks}-week career roadmap.
 Current Education: ${input.education || 'Not specified'}
@@ -826,7 +902,7 @@ Return:
 - learningPriorities: ranked top 4-5 learning priorities to focus on first
 - milestones: 4 to 5 sequential milestones covering foundations, core competencies, portfolio projects, and interview/job launch readiness. Each milestone must have a unique short id (m1, m2, ...), phase label, title, duration, description, learning topics, recommended portfolio projects, and concrete weekly activities.`;
 
-  return withRetry(async () => {
+  return executeWithModelFallback(async (model) => {
     const response = await ai.models.generateContent({
       model,
       contents: prompt,

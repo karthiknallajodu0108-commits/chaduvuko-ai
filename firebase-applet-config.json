@@ -3,6 +3,7 @@
   "appId": "1:305990139327:web:f0af5e7bf5c7a67983b50a",
   "apiKey": "AIzaSyB00ngmOSiZV7qwJGGvqMo94ytFKgUcdEk",
   "authDomain": "studied-option-r6gf7.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-careerpilot-5bfa665a-4fc1-4114-acc5-c177072bba0e",
   "storageBucket": "studied-option-r6gf7.firebasestorage.app",
   "messagingSenderId": "305990139327",
   "measurementId": "",

@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-sans: "DM Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-midnight: #101828;
+  --color-navy: #142033;
+  --color-canvas: #F8FAFC;
+  --color-mint: #6EE7B7;
+  --color-mint-deep: #059669;
+  --color-lavender: #C4B5FD;
+  --color-lavender-deep: #7C3AED;
+  --color-soft-blue: #93C5FD;
+  --color-ink: #172033;
+  --color-muted: #64748B;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+    color: #172033;
+    background-color: #F8FAFC;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom sleek scrollbars for workspace panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.25);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.45);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

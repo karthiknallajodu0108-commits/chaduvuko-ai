@@ -1,0 +1,6 @@
+{
+  "name": "CareerPilot",
+  "description": "AI career operating system — find your fit, build your edge, and land your role.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

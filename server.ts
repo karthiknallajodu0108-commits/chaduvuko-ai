@@ -36,6 +36,64 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
+function buildAllowedOrigins(): Set<string> {
+  const defaults = [
+    'https://chaduvuko-ai.vercel.app',
+    'https://chaduvuko-ai.onrender.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+  ];
+  const configured = [
+    ...(process.env.ALLOWED_ORIGINS || '').split(','),
+    process.env.APP_URL || '',
+  ];
+
+  const allowed = new Set<string>(defaults);
+  for (const raw of configured) {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.startsWith('MY_')) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+        allowed.add(parsed.origin);
+      }
+    } catch {
+      // Ignore malformed origin entries
+    }
+  }
+  return allowed;
+}
+
+const allowedOrigins = buildAllowedOrigins();
+
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    const isAllowed = allowedOrigins.has(origin);
+    if (isAllowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+      res.setHeader('Access-Control-Max-Age', '86400');
+    } else if (req.method === 'OPTIONS') {
+      res.status(403).json({ error: 'Origin not allowed.' });
+      return;
+    }
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+
+  next();
+});
+
 app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({
